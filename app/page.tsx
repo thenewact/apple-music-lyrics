@@ -1,3 +1,2 @@
-import AppleMusicLyricsPlayer from "@/components/AppleMusicLyricsPlayer";
-
-export default function Page() { return <AppleMusicLyricsPlayer />; }
+import Player from "@/components/Player/Player";
+export default function Page() { return <Player />; }

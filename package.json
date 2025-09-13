@@ -9,10 +9,16 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "chroma-js": "^3.1.2",
+    "fast-average-color": "^9.5.0",
     "framer-motion": "^12.23.12",
+    "idb": "^8.0.3",
     "next": "15.5.3",
+    "node-fetch": "^3.3.2",
     "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react-dom": "19.1.0",
+    "react-window": "^2.1.0",
+    "wavesurfer.js": "^7.10.1"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
