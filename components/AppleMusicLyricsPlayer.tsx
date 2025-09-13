@@ -1,160 +1,225 @@
 "use client";
-import React, { useRef, useState, useEffect } from "react";
-import { motion } from "framer-motion";
+import React, { useEffect, useRef, useState } from "react";
 
 /**
- * Player.jsx
- * - Upload audio (.mp3 etc) + .lrc
- * - Parses LRC into [{time, text}]
- * - Syncs text with audio using RAF
- * - Large centered lyric + layered blurred repeats (Apple-like)
+ * AppleMusicLyricsPlayer
+ * - fixed bugs: stable event handlers, proper cleanup, safer LRC parse, revoke blobs, RAF lifecycle
+ * - drop-in for Next.js app router (components/)
  */
 
-export default function Player() {
-  const [audioSrc, setAudioSrc] = useState(null);
-  const [fileName, setFileName] = useState(null);
-  const [audioError, setAudioError] = useState(null);
+export default function AppleMusicLyricsPlayer() {
+  const [audioSrc, setAudioSrc] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [audioError, setAudioError] = useState<string | null>(null);
 
   const [rawLrc, setRawLrc] = useState("");
-  const [lyrics, setLyrics] = useState([]);
-  const [index, setIndex] = useState(-1);
+  const [lyrics, setLyrics] = useState<{ time: number; text: string }[]>([]);
+  const [index, setIndex] = useState<number>(-1);
 
-  const audioRef = useRef(null);
-  const rafRef = useRef(null);
-  const activeBlob = useRef(null);
-  const currentIndexRef = useRef(-1);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const activeBlob = useRef<string | null>(null);
+  const currentIndexRef = useRef<number>(-1);
+  const mountedRef = useRef(true);
 
-  // parse LRC
-  function parseLRC(text) {
+  // parse LRC -> [{time, text}]
+  function parseLRC(text: string) {
     if (!text) return [];
     const lines = String(text).split(/\r?\n/);
-    const entries = [];
     const re = /\[(\d{1,2}):(\d{2}(?:\.\d{1,3})?)\]/g;
-    for (let raw of lines) {
+    const out: { time: number; text: string }[] = [];
+
+    for (const raw of lines) {
+      if (!raw.trim()) continue;
       re.lastIndex = 0;
-      let m;
-      const times = [];
+      let m: RegExpExecArray | null;
+      const times: number[] = [];
       while ((m = re.exec(raw)) !== null) {
         const mm = parseInt(m[1], 10);
         const ss = parseFloat(m[2]);
-        times.push(mm * 60 + ss);
+        if (!Number.isNaN(mm) && !Number.isNaN(ss)) times.push(mm * 60 + ss);
       }
       const txt = raw.replace(re, "").trim();
-      for (const t of times) entries.push({ time: t, text: txt });
+      if (!txt) continue;
+      for (const t of times) out.push({ time: t, text: txt });
     }
-    return entries.sort((a, b) => a.time - b.time);
+
+    return out.sort((a, b) => a.time - b.time);
   }
 
-  // audio upload
-  function onAudioFile(e) {
+  // audio file upload
+  function onAudioFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
     setAudioError(null);
-    let url;
+
+    let url: string;
     try {
       url = URL.createObjectURL(f);
-    } catch {
+    } catch (err) {
       setAudioError("Could not create object URL for file.");
       return;
     }
+
+    // revoke previous blob after swap
     const prev = activeBlob.current;
     activeBlob.current = url;
     setAudioSrc(url);
     setFileName(f.name || "track");
+
     if (prev && prev !== url) {
-      try { URL.revokeObjectURL(prev); } catch {}
+      try {
+        URL.revokeObjectURL(prev);
+      } catch {}
     }
-    // attempt load; audio element reports real errors
-    requestAnimationFrame(() => audioRef.current?.load());
+
+    // attempt explicit load
+    requestAnimationFrame(() => {
+      try {
+        audioRef.current?.load();
+      } catch {}
+    });
   }
 
   // lrc upload
-  function onLrcFile(e) {
+  function onLrcFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
     const r = new FileReader();
     r.onload = () => {
       const text = String(r.result || "");
       setRawLrc(text);
-      setLyrics(parseLRC(text));
+      const parsed = parseLRC(text);
+      setLyrics(parsed);
       setIndex(-1);
       currentIndexRef.current = -1;
     };
     r.readAsText(f);
   }
 
-  function onPasteLrc(e) {
+  // paste/edit textarea
+  function onPasteLrc(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const v = e.target.value;
     setRawLrc(v);
-    setLyrics(parseLRC(v));
+    const parsed = parseLRC(v);
+    setLyrics(parsed);
     setIndex(-1);
     currentIndexRef.current = -1;
   }
 
-  // audio error handling
+  // audio element handlers (attach once)
   useEffect(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    function err() {
-      setAudioError("Playback error. File may be unsupported by this browser.");
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    function onError() {
+      const code = (audio.error && (audio.error as any).code) || 0;
+      setAudioError(`Playback error. Code ${code}.`);
       setAudioSrc(null);
       setFileName(null);
     }
-    function can() {
+
+    function onCanPlay() {
       setAudioError(null);
     }
-    a.addEventListener("error", err);
-    a.addEventListener("canplay", can);
-    return () => {
-      a.removeEventListener("error", err);
-      a.removeEventListener("canplay", can);
-    };
-  }, [audioRef.current]);
 
-  // RAF sync
+    audio.addEventListener("error", onError);
+    audio.addEventListener("canplay", onCanPlay);
+
+    return () => {
+      audio.removeEventListener("error", onError);
+      audio.removeEventListener("canplay", onCanPlay);
+    };
+    // intentionally run once - audioRef.current identity stable in DOM lifecycle
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // RAF sync loop for lyrics
   useEffect(() => {
-    if (!lyrics || lyrics.length === 0) return;
+    if (!lyrics || lyrics.length === 0) {
+      setIndex(-1);
+      currentIndexRef.current = -1;
+      return;
+    }
+
+    mountedRef.current = true;
     let cancelled = false;
+
     function loop() {
-      if (cancelled) return;
+      if (cancelled || !mountedRef.current) return;
       const a = audioRef.current;
       if (!a) {
         rafRef.current = requestAnimationFrame(loop);
         return;
       }
       const t = a.currentTime || 0;
-      // binary search
-      let low = 0, high = lyrics.length - 1, ans = -1;
+
+      // binary search for last index <= t
+      let low = 0,
+        high = lyrics.length - 1,
+        ans = -1;
       while (low <= high) {
         const mid = Math.floor((low + high) / 2);
         if (lyrics[mid].time <= t) {
-          ans = mid; low = mid + 1;
+          ans = mid;
+          low = mid + 1;
         } else high = mid - 1;
       }
+
       if (ans !== currentIndexRef.current) {
         currentIndexRef.current = ans;
         setIndex(ans);
       }
+
       rafRef.current = requestAnimationFrame(loop);
     }
+
     rafRef.current = requestAnimationFrame(loop);
-    return () => { cancelled = true; if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+    return () => {
+      cancelled = true;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
   }, [lyrics]);
 
-  // sample LRC helper for testing
+  // cleanup on unmount: revoke blob, stop RAF, pause audio
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (activeBlob.current) {
+        try {
+          URL.revokeObjectURL(activeBlob.current);
+        } catch {}
+        activeBlob.current = null;
+      }
+      try {
+        audioRef.current?.pause();
+        audioRef.current?.removeAttribute("src");
+      } catch {}
+    };
+  }, []);
+
+  // sample LRC for quick test
   function loadSample() {
-    const sample = `[00:00.00] Sample demo lyric line\n[00:04.00] The next big line shows\n[00:08.50] Apple-like centered lyric\n[00:12.00] Another sample line`;
+    const sample =
+      "[00:00.00] Sample demo lyric line\n[00:04.00] The next big line shows\n[00:08.50] Apple-like centered lyric\n[00:12.00] Another sample line";
     setRawLrc(sample);
-    setLyrics(parseLRC(sample));
+    const parsed = parseLRC(sample);
+    setLyrics(parsed);
+    setIndex(-1);
+    currentIndexRef.current = -1;
   }
 
-  // visual component
+  // Lyric visual (keeps it simple and robust)
   function LyricVisual() {
-    const center = (lyrics[index]?.text) || (lyrics[0]?.text) || "";
+    const center = (index >= 0 ? lyrics[index]?.text : lyrics[0]?.text) || "";
     const layers = 6;
     const stack = [];
     for (let i = 0; i < layers; i++) {
-      stack.push({ text: lyrics[(index + i) < lyrics.length ? index + i : 0]?.text || center, i });
+      const idx = index + i;
+      const text = idx >= 0 && idx < lyrics.length ? lyrics[idx].text : center;
+      stack.push({ text, i });
     }
 
     return (
@@ -162,23 +227,26 @@ export default function Player() {
         <div className="absolute inset-0 bg-gradient-to-b from-transparent via-black/20 to-black/60 pointer-events-none" />
         <div className="relative z-10 w-full max-w-4xl text-center">
           <div className="absolute inset-0 flex items-center justify-center -z-0 pointer-events-none">
-            {stack.map(s => {
+            {stack.map((s) => {
               const depth = s.i;
               const opacity = Math.max(0, 0.6 - depth * 0.11);
               const translate = depth * 24;
               const scale = 1 - depth * 0.03;
               const blur = depth * 3;
               return (
-                <div key={depth} style={{
-                  position: "absolute",
-                  left: "50%",
-                  transform: `translate(-50%, ${translate}px) scale(${scale})`,
-                  filter: `blur(${blur}px)`,
-                  opacity,
-                  transition: "all 420ms ease",
-                  width: "100%",
-                  textAlign: "center"
-                }}>
+                <div
+                  key={depth}
+                  style={{
+                    position: "absolute",
+                    left: "50%",
+                    transform: `translate(-50%, ${translate}px) scale(${scale})`,
+                    filter: `blur(${blur}px)`,
+                    opacity,
+                    transition: "all 420ms ease",
+                    width: "100%",
+                    textAlign: "center",
+                  }}
+                >
                   <div style={{ color: "rgba(255,255,255,0.9)", fontWeight: 600, fontSize: 48, lineHeight: "1.05em" }}>
                     {s.text}
                   </div>
@@ -215,7 +283,9 @@ export default function Player() {
           <input accept="audio/*,audio/mpeg" onChange={onAudioFile} type="file" />
           <label className="text-xs text-gray-200">Upload .lrc</label>
           <input accept=".lrc,text/plain" onChange={onLrcFile} type="file" />
-          <button onClick={loadSample} className="mt-2 px-3 py-2 rounded bg-white/5 text-sm">Load sample LRC</button>
+          <button onClick={loadSample} className="mt-2 px-3 py-2 rounded bg-white/5 text-sm">
+            Load sample LRC
+          </button>
         </div>
 
         <div className="mt-6 text-sm text-gray-300">{fileName || "No audio loaded"}</div>
@@ -236,7 +306,11 @@ export default function Player() {
           <div className="p-3 bg-black/10 rounded text-white/80">
             <div className="text-sm mb-2">Parsed lines: {lyrics.length}</div>
             <div className="max-h-40 overflow-auto text-sm space-y-1">
-              {lyrics.map((l, i) => <div key={i} className={i===index ? "text-white font-semibold" : "text-white/60"}>{l.text}</div>)}
+              {lyrics.map((l, i) => (
+                <div key={i} className={i === index ? "text-white font-semibold" : "text-white/60"}>
+                  {l.text}
+                </div>
+              ))}
             </div>
           </div>
         </div>
